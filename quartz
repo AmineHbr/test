@@ -1,0 +1,403 @@
+CREATE TABLE [dbo].[ExecutionLogs](
+	[Id] [uniqueidentifier] NOT NULL,
+	[ExecutionDate] [datetime2](7) NULL,
+	[Type] [nvarchar](20) NOT NULL,
+	[Params] [nvarchar](max) NOT NULL,
+	[Status] [nvarchar](20) NOT NULL,
+ CONSTRAINT [PK_ExecutionLogs] PRIMARY KEY CLUSTERED 
+(
+	[Id] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, FILLFACTOR = 95, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
+
+
+  public class EbookSynchronizer : IEbookSynchronizer
+    {
+        private const int PageSize = 10000;
+        private readonly IEbookMongoRepository _ebookMongoRepository;
+        private readonly IEbookSqlServerRepository _ebookSqlServerRepository;
+        private readonly IMapper _mapper;
+        private readonly Serilog.ILogger _logger;
+
+
+
+        public EbookSynchronizer(IEbookMongoRepository ebookMongoRepository
+            , IEbookSqlServerRepository ebookSqlServerRepository
+            , IMapper mapper
+            , Serilog.ILogger logger)
+        {
+            _ebookMongoRepository = ebookMongoRepository;
+            _ebookSqlServerRepository = ebookSqlServerRepository;
+            _mapper = mapper;
+            _logger = logger;
+        }
+
+        public async Task InitSynchronization()
+        {
+            _countryNames = await CountryNameMapper.GetMappingAsync();
+            _issuerCountries = await IssuerCountriesMapper.GetMappingAsync();
+            _investorCountries = await InvestorCountriesMapper.GetMappingAsync();
+
+            await _ebookSqlServerRepository.PrepareEbookTables();
+        }
+
+        public async Task<EbookBatchPageResponse> BatchSynchronize(int startIndex)
+        {
+            if (startIndex == 0)
+            {
+                _logger.Information($"Start indexing ebook data");
+            }
+
+            int pageIndex = startIndex;
+
+            _logger.Information($"Getting batch {pageIndex + 1} from ebook");
+
+            IEnumerable<EbookOrderIndex> data =
+                await _ebookMongoRepository.GetEbookData(pageIndex, PageSize);
+
+            if (data.Any())
+            {
+                await BulkUpsertEbookDeals(data);
+            }
+
+            return new EbookBatchPageResponse
+            {
+                NextPageIndex = data.Count() >= PageSize ? pageIndex + 1 : null,
+                PageSize = data.Count(),
+                UnKnownCountries = unKnownCountries,
+            };
+        }
+
+            await _ebookSqlServerRepository.BulkUpsertEbookDealInfos(ebookDealInfos);
+            await _ebookSqlServerRepository.BulkInsertEbookOrderInfos(ebookOrderInfos);
+        }
+
+        private string GenerateId(int dealId, int trancheId, DateTime tradeDate, string issuerName
+            , string issuerSector, string issuerCountry, string currency, DateTime maturityDate, string trancheName, string isin)
+        {
+            string combinedValues = $"{dealId}{trancheId}{tradeDate}{issuerName}{issuerSector}{issuerCountry}{currency}{maturityDate}{trancheName}{isin}";
+
+            byte[] hashBytes;
+            using (SHA256 sHA256 = SHA256.Create())
+            {
+                byte[] inputBytes = Encoding.UTF8.GetBytes(combinedValues);
+                hashBytes = sHA256.ComputeHash(inputBytes);
+            }
+
+            StringBuilder sb = new StringBuilder();
+            foreach (byte b in hashBytes)
+            {
+                sb.Append(b.ToString("x2"));
+            }
+
+            return sb.ToString();
+        }
+    }
+public class EbookBatchPageResponse
+    {
+        public int? NextPageIndex { get; set; }
+
+        public int PageSize { get; set; }
+
+        public HashSet<string> UnKnownCountries { get; set; }
+    }
+
+
+
+  [DisallowConcurrentExecution]
+    public class EbookIngestJob : IJob
+    {
+        public static class SynchronizationJobParameters
+        {
+            public const string EbookMinDateTime = "EbookMinDateTime";
+            public const string JobId = "JobId";
+        }
+
+        private readonly Serilog.ILogger _logger;
+        private readonly IExecutionLogRepository _executionLogRepository;
+        private readonly IEbookSynchronizer _ebookSynchronizer;
+
+
+        public EbookIngestJob(Serilog.ILogger logger, IExecutionLogRepository executionLogRepository, IEbookSynchronizer ebookSynchronizer)
+        {
+            _logger = logger;
+            _executionLogRepository = executionLogRepository;
+            _ebookSynchronizer = ebookSynchronizer;
+        }
+
+        public async Task Execute(IJobExecutionContext context)
+        {
+            try
+            {
+                JobDataMap dataMap = context.MergedJobDataMap;
+                var guid = dataMap.GetNullableGuid("JobId") ?? Guid.NewGuid();
+                using (LogContext.PushProperty("ExecutionId", guid))
+                {
+
+                    _logger.Information("Starting job ...");
+                    var minDateTime = ParseJobParameters(dataMap);
+
+                    await _executionLogRepository.AddLog(new ExecutionLog
+                    {
+                        Id = guid,
+                        Params = JsonSerializer.Serialize(new { Type = "EBOOK", MinRfqRowId = minDateTime }),
+                        Type = ExecutionType.Automatic,
+                        Status = Status.Scheduled
+                    });
+
+                    try
+                    {
+                        int totalIngestedEbookItems = 0;
+                        _logger.Information("Start ingesting ebook data...");
+                        await _executionLogRepository.SetExecutionStatus(guid, Status.InProgress);
+
+                        totalIngestedEbookItems = await SynchronizeEbookData(context.CancellationToken);
+
+                        if (context.CancellationToken.IsCancellationRequested)
+                        {
+                            _logger.Warning($"Job {guid} aborted");
+                            await _executionLogRepository.SetExecutionStatus(guid, Status.Aborted);
+                        }
+                        else
+                        {
+                            _logger.Information($"Job {guid} successfully executed");
+                            await _executionLogRepository.SetExecutionStatus(guid, Status.Succeded);
+
+                            using (LogContext.PushProperty("totalIngestedEbookItems", totalIngestedEbookItems))
+                            {
+                                _logger.Information($"End ingesting ebook data, total ingested items = {totalIngestedEbookItems}...");
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Error(ex, "Error while ingesting ebook data");
+                        await _executionLogRepository.SetExecutionStatus(guid, Status.Failed);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Fatal(ex, "Error in ebook ingesting job");
+            }
+        }
+
+        private static DateTime? ParseJobParameters(JobDataMap dataMap)
+        {
+            DateTime minDateTime = dataMap.GetDateTime(SynchronizationJobParameters.EbookMinDateTime);
+
+            return minDateTime == default(DateTime) ? null : minDateTime;
+        }
+
+        private async Task<int> SynchronizeEbookData(CancellationToken cancellationToken)
+        {
+            Dapper.SqlMapper.Settings.CommandTimeout = 0;
+            int totalIndexedCartItems = 0;
+            int index = 0;
+
+            await _ebookSynchronizer.InitSynchronization();
+            while (index >= 0 && !cancellationToken.IsCancellationRequested)
+            {
+                var p = await _ebookSynchronizer.BatchSynchronize(index);
+                index = p.NextPageIndex ?? -1;
+                totalIndexedCartItems += p.PageSize;
+            }
+
+            return totalIndexedCartItems;
+        }
+    }
+
+
+
+
+public class ExecutionLogRepository : IExecutionLogRepository
+    {
+        private readonly IDatabaseConnectionFactory _connectionFactory;
+
+        public ExecutionLogRepository(IDatabaseConnectionFactory connectionFactory)
+        {
+            _connectionFactory = connectionFactory;
+        }
+
+        public async Task AddLog(ExecutionLog executionLog)
+        {
+            var sqlQuery = $@"INSERT INTO [dbo].[ExecutionLogs]
+                                    ([Id]
+                                    ,[ExecutionDate]
+                                    ,[Type]
+                                    ,[Params]
+                                    ,[Status])
+                                VALUES
+                                    (@Id
+                                    ,@ExecutionDate
+                                    ,@Type
+                                    ,@Params
+                                    ,@Status);";
+
+            await _connectionFactory.GetVectorConnection().ExecuteAsync(sqlQuery, executionLog);
+        }
+
+        public async Task<ExecutionLog> GetLog(Guid id)
+        {
+            string sql = "SELECT * FROM [dbo].[ExecutionLogs] WHERE [Id] = @Id;";
+
+            return await _connectionFactory.GetVectorConnection().QuerySingleOrDefaultAsync<ExecutionLog>(sql, new { Id = id });
+        }
+
+        public async Task<IEnumerable<ExecutionLog>> GetLogs()
+        {
+            string sql = "SELECT * FROM [dbo].[ExecutionLogs];";
+
+            return await _connectionFactory.GetVectorConnection().QueryAsync<ExecutionLog>(sql);
+        }
+
+        public async Task SetExecutionStatus(Guid executionLogId, Status status)
+        {
+            string sql = "UPDATE [dbo].[ExecutionLogs] SET Status = @Status";
+            sql = status == Status.InProgress ? $"{sql} , ExecutionDate = @ExecutionDate" : sql;
+            sql = $"{sql} WHERE [Id] = @Id;";
+
+            await _connectionFactory.GetVectorConnection().ExecuteAsync(sql, new { Id = executionLogId, Status = status, ExecutionDate = DateTime.Now });
+        }
+
+    }
+
+
+
+ public static class JobExtensions
+    {
+        public const string MainSchedulerName = "QuartzScheduler";
+  public static readonly JobKey EbookIngestJobKey = new JobKey("ebook ingest batch", "vector batches");
+        public static readonly TriggerKey EbookIngestTriggerKey = new TriggerKey("ebook synchornizer trigger");
+  public static JobDataMap CreateEbookJobData(DateTime? minDateTime, Guid? jobInstanceId = null)
+        {
+            Dictionary<string, object> data = new Dictionary<string, object>
+            {
+                { EbookIngestJob.SynchronizationJobParameters.EbookMinDateTime, minDateTime},
+            };
+
+            if (jobInstanceId.HasValue)
+            {
+                data.Add(EbookIngestJob.SynchronizationJobParameters.JobId, jobInstanceId.Value);
+            }
+
+            return new JobDataMap(data as IDictionary<string, object>);
+        }
+}
+
+
+
+    public static class QuartzExtensions
+    {
+        public static IServiceCollection AddJobScheduling(this IServiceCollection builder)
+        {
+builder.AddQuartz(q =>
+            {
+                // handy when part of cluster or you want to otherwise identify multiple schedulers
+                q.SchedulerId = "vector-ingest-scheduler";
+
+                q.UseMicrosoftDependencyInjectionJobFactory();
+
+                q.AddJob<EbookIngestJob>(j => j
+                    .StoreDurably()
+                    .WithIdentity(JobExtensions.EbookIngestJobKey)
+                    .WithDescription("ebook ingest job")
+                );
+ var ebookJobData = JobExtensions.CreateEbookJobData(null);
+ q.AddTrigger(t => t
+                    .WithIdentity(JobExtensions.CartIngestTriggerKey)
+                    .ForJob(JobExtensions.CartIngestJobKey).UsingJobData(cartJobData)
+                    .StartNow()
+                    .WithSimpleSchedule(x => x.WithInterval(TimeSpan.FromMinutes(30)).RepeatForever())
+                    .WithDescription("trigger a cart ingest every 30 minutes")
+                );
+
+                q.AddTrigger(t => t
+                    .WithIdentity(JobExtensions.EbookIngestTriggerKey)
+                    .ForJob(JobExtensions.EbookIngestJobKey).UsingJobData(ebookJobData)
+                    .StartNow()
+                    .WithCronSchedule("0 30 7 * * ?")
+                    .WithDescription("trigger ebook ingest every day 7:30am")
+                );
+       });
+
+            // ASP.NET Core hosting
+            builder.AddQuartzServer(options =>
+            {
+                // when shutting down we want jobs to complete gracefully
+                options.WaitForJobsToComplete = true;
+            });
+
+            return builder;
+        }
+    }
+
+   [HttpPost("ebook")]
+        public async Task<IActionResult> IngestEbook([FromBody] EbookIngestRequest request)
+        {
+            var guid = Guid.NewGuid();
+            var jobData = JobExtensions.CreateEbookJobData(request.MinDateTime, guid);
+            var executionLog = await StartSynchronizationJob(jobData, guid, JobExtensions.EbookIngestJobKey);
+
+            return Ok(executionLog);
+        }
+  [HttpGet]
+        public async Task<IActionResult> GetAll()
+        {
+            return Ok(await _executionLogRepository.GetLogs());
+        }
+
+        [HttpPut("pause")]
+        public async Task<IActionResult> PauseSynchronization()
+        {
+            var scheduler = await _schedulerFactory.GetScheduler(JobExtensions.MainSchedulerName);
+            var job = await scheduler.GetJobDetail(JobExtensions.CartIngestJobKey);
+
+            if (job != null)
+            {
+                await scheduler.Interrupt(job.Key);
+            }
+            await scheduler.PauseTrigger(JobExtensions.CartIngestTriggerKey);
+
+            return Ok();
+        }
+
+        [HttpPut("resume")]
+        public async Task<IActionResult> UnPauseSynchronization()
+        {
+            var scheduler = await _schedulerFactory.GetScheduler(JobExtensions.MainSchedulerName);
+            await scheduler.ResumeTrigger(JobExtensions.CartIngestTriggerKey);
+
+            return Ok();
+        }
+
+
+
+
+ public class ExecutionLog
+    {
+        public Guid Id { get; set; }
+
+        public DateTime? ExecutionDate { get; set; }
+
+        public ExecutionType Type { get; set; }
+
+        public string Params { get; set; }
+
+        public Status Status { get; set; }
+    }
+
+    public enum ExecutionType
+    {
+        Automatic,
+        Manual
+    }
+
+    public enum Status
+    {
+        Scheduled,
+        InProgress,
+        Succeded,
+        Failed,
+        Aborted
+    }
