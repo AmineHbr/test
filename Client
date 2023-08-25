@@ -1,0 +1,126 @@
+ public class EbookApiClient : IEbookApiClient
+    {
+        private readonly AccessTokensCacheManager _accessTokensCacheManager = new AccessTokensCacheManager();
+        private readonly IEbookApi _instance;
+        private readonly EbookOptions _ebookOptions;
+
+        public EbookApiClient(EbookOptions ebookOptions, IHttpClientFactory httpClientFactory)
+        {
+            _ebookOptions = ebookOptions;
+
+            var httpClient = new HttpClient(new ModifyingClientHttpHandler(async (request, cancellationToken) =>
+            {
+                var auth = request.Headers.Authorization;
+                if (auth != null)
+                {
+                    var token = _accessTokensCacheManager.GetToken(_ebookOptions.ClientId);
+                    if (token == null)
+                    {
+                        token = await GetToken();
+                        _accessTokensCacheManager.AddOrUpdateToken(_ebookOptions.ClientId, token);
+                    }
+
+                    request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue(auth.Scheme, token.AccessToken);
+                }
+            }))
+            {
+                BaseAddress = new Uri(ebookOptions.ApiBaseUrl),
+                Timeout = TimeSpan.FromMinutes(5)
+            };
+
+            _instance = httpClientFactory.CreateApiInstance<IEbookApi>(httpClient);
+        }
+
+        private async Task<TokenResponse> GetToken()
+        {
+            var client = new HttpClient();
+
+            return await client.RequestClientCredentialsTokenAsync(new ClientCredentialsTokenRequest
+            {
+                Address = _ebookOptions.IdentityProviderUrl + "/connect/token",
+                ClientId = _ebookOptions.ClientId,
+                ClientSecret = _ebookOptions.ClientSecret
+            });
+        }
+
+        public Task<EbookPagedResponse<Order>> GetOrdersAsync(DateTime startTimeStamp, DateTime endTimeStamp, int pageSize = 100)
+        {
+            return _instance.GetOrdersAsync(startTimeStamp.ToString("yyyy-MM-ddTHH:mm:ssZ"), endTimeStamp.ToString("yyyy-MM-ddTHH:mm:ssZ"), pageSize);
+        }
+
+      
+    }
+ public class HttpClientFactory : IHttpClientFactory
+    {
+        public T CreateApiInstance<T>(HttpClient httpClient)
+        {
+            return RestClient.For<T>(httpClient);
+        }
+    }
+
+ public class AccessTokensCacheManager
+    {
+        private readonly ConcurrentDictionary<string, AccessTokenCacheEntry>
+        _cache = new ConcurrentDictionary<string, AccessTokenCacheEntry>();
+
+        public void AddOrUpdateToken(string clientId, IdentityModel.Client.TokenResponse accessToken)
+        {
+            var newToken = new AccessTokenCacheEntry(accessToken);
+            _cache.TryRemove(clientId, out _);
+            _cache.TryAdd(clientId, newToken);
+        }
+
+        public IdentityModel.Client.TokenResponse? GetToken(string clientId)
+        {
+            _cache.TryGetValue(clientId, out var tokenCacheEntry);
+            return tokenCacheEntry != null && tokenCacheEntry.IsValid
+                ? tokenCacheEntry.Token
+                : null;
+        }
+
+        private class AccessTokenCacheEntry
+        {
+            public AccessTokenCacheEntry(IdentityModel.Client.TokenResponse token)
+            {
+                Token = token;
+                RefreshAfterDate = DateTime.UtcNow + TimeSpan.FromSeconds(token.ExpiresIn / 2.0);
+            }
+
+            public IdentityModel.Client.TokenResponse Token { get; }
+
+            private DateTime RefreshAfterDate { get; }
+            public bool IsValid => DateTime.UtcNow < RefreshAfterDate;
+        }
+    }
+public static class Extensions
+    {
+        private const string SectionName = "ebook";
+
+        public static IServiceCollection AddEbookClient(this IServiceCollection builder, string sectionName = SectionName)
+        {
+            if (string.IsNullOrWhiteSpace(sectionName))
+            {
+                sectionName = SectionName;
+            }
+
+            ServiceProvider provider = builder.BuildServiceProvider();
+
+            var options = provider.GetService<IConfiguration>().GetOptions<EbookOptions>(sectionName);
+            return builder.AddEbookClient(options);
+        }
+
+        public static IServiceCollection AddEbookClient(this IServiceCollection builder, EbookOptions options)
+        {
+            builder.AddSingleton(options);
+            builder.AddTransient<IHttpClientFactory, HttpClientFactory>();
+            builder.AddTransient<IEbookApiClient, EbookApiClient>();
+            return builder;
+        }
+
+        public static TModel GetOptions<TModel>(this IConfiguration configuration, string sectionName) where TModel : new()
+        {
+            TModel model = new TModel();
+            configuration.GetSection(sectionName).Bind(model);
+            return model;
+        }
+    }
