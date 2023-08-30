@@ -1,0 +1,176 @@
+using Quartz;
+using Serilog;
+using Serilog.Context;
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using Vector.Batches.Elastic.Dto;
+using Vector.Batches.Elastic.Infrastructure.ElasticSearch;
+using Vector.Batches.Elastic.Infrastructure.External;
+using Vector.Batches.Elastic.Infrastructure.SqlServer.Entities;
+using Vector.Batches.Elastic.Infrastructure.SqlServer.Repositories;
+using Vector.Batches.Elastic.Infrastructure.Synchronization;
+using Vector.Common.Domain.Ebook;
+using Status = Vector.Batches.Elastic.Infrastructure.SqlServer.Entities.Status;
+
+namespace Vector.Batches.Elastic.Infrastructure.Scheduling
+{
+    [DisallowConcurrentExecution]
+    public class EbookSynchronizationJob : IJob
+    {
+        public static class EbookSynchronizationJobParameters
+        {
+            public const string JobId = "JobId";
+            public const string TypeExecution = "TypeExecution";
+        }
+
+        private readonly ILogger _logger;
+        private readonly IVectorApiClient _vectorApiClient;
+        private readonly IExecutionLogRepository _executionLogRepository;
+        private readonly IVectorIndexer _vectorIndexer;
+        private readonly IEbookSynchronizer _ebookSynchronizer;
+        private readonly ElasticOptions _options;
+
+        private string _ebookIndexName;
+        private string _ebookDealsIndexName;
+        private string _ebookAlias;
+        private string _ebookDealsAlias;
+
+
+        public EbookSynchronizationJob(ILogger logger
+            , IVectorApiClient vectorApiClient
+            , IExecutionLogRepository executionLogRepository
+            , IVectorIndexer vectorIndexer
+            , IEbookSynchronizer ebookSynchronizer
+            , ElasticOptions options)
+        {
+            _logger = logger;
+            _vectorApiClient = vectorApiClient;
+            _executionLogRepository = executionLogRepository;
+            _vectorIndexer = vectorIndexer;
+            _ebookSynchronizer = ebookSynchronizer;
+            _options = options;
+
+            _ebookAlias = $"{_options.EbookIndexName}-latest";
+            _ebookDealsAlias = $"{_options.EbookIndexName}-deals-latest";
+        }
+
+        public async Task Execute(IJobExecutionContext context)
+        {
+            try
+            {
+                JobDataMap dataMap = context.MergedJobDataMap;
+                var guid = dataMap.GetNullableGuid("JobId") ?? Guid.NewGuid();
+                using (LogContext.PushProperty("ExecutionId", guid))
+                {
+
+                    _logger.Information("Starting job ...");
+                    EbookSynchronizationRequest request = ParseJobParameters(dataMap);
+                    await _executionLogRepository.AddLog(new ExecutionLog
+                    {
+                        Id = guid,
+                        ExecutionDate = DateTime.Now,
+                        ShouldIndexEbook = true,
+                        ShouldIndexPrimary = false,
+                        ShouldIndexCart = false,
+                        CartMinRfq = null,
+                        ShouldRecreateCartIndex = false,
+                        TypeIndexation = request.Type,
+                        StatusIndexation = Status.Scheduled
+                    });
+
+                    try
+                    {
+                        int totalIndexedCartItems = 0, totalIndexedEbookItems = 0; int totalIndexedGlobalPrimaryItems = 0;
+                        _logger.Information("Start indexing data to elastic search...");
+                        await _executionLogRepository.SetExecutionStatus(guid, Status.InProgress);
+
+                        await PrepareIndices();
+
+                        totalIndexedEbookItems = await SynchronizeEbookData(context.CancellationToken);
+
+                        await SwitchLiveIndices();
+
+                        if (totalIndexedCartItems > 0)
+                        {
+                            await _vectorApiClient.InvalidateCacheAsync();
+                        }
+
+                        await _vectorIndexer.DeleteNonLiveIndices(new Dictionary<string, string>
+                        {
+                            { _options.EbookIndexName, _ebookAlias},
+                            { $"{_options.EbookIndexName}-deals", _ebookDealsAlias}
+                        });
+
+                        if (context.CancellationToken.IsCancellationRequested)
+                        {
+                            _logger.Warning($"Job {guid} aborted");
+                            await _executionLogRepository.SetExecutionStatus(guid, Status.Aborted);
+                        }
+                        else
+                        {
+                            _logger.Information($"Job {guid} successfully executed");
+                            await _executionLogRepository.SetExecutionStatus(guid, Status.Succeded);
+
+
+                            using (LogContext.PushProperty("TotalIndexedEbookItems", totalIndexedEbookItems))
+                            {
+
+                                var totalIndexedItems = totalIndexedCartItems + totalIndexedEbookItems + totalIndexedGlobalPrimaryItems;
+                                _logger.Information($"End indexing data to elastic search, total indexed ebook items = {totalIndexedItems}...");
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Error(ex, "Error while indexing data");
+                        await _executionLogRepository.SetExecutionStatus(guid, Status.Failed);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Fatal(ex, "Error in synchronization job");
+            }
+        }
+
+        private async Task<int> SynchronizeEbookData(CancellationToken cancellationToken)
+        {
+            int totalIndexedEbookItems = 0;
+            int index = 0;
+
+            while (index >= 0 && !cancellationToken.IsCancellationRequested)
+            {
+                var p = await _ebookSynchronizer.BatchSynchronize(_ebookIndexName, _ebookDealsIndexName, index);
+                index = p.NextPageIndex ?? -1;
+                totalIndexedEbookItems += p.PageSize;
+            }
+
+            return totalIndexedEbookItems;
+        }
+        private static EbookSynchronizationRequest ParseJobParameters(JobDataMap dataMap)
+        {
+            var executionType = (ExecutionType)dataMap.Get(EbookSynchronizationJobParameters.TypeExecution);
+            return new EbookSynchronizationRequest(executionType);
+        }
+
+        private async Task PrepareIndices()
+        {
+            _ebookIndexName = await _vectorIndexer.GetLiveIndexName(_ebookAlias) ?? _options.EbookIndexName;
+            _ebookDealsIndexName = await _vectorIndexer.GetLiveIndexName(_ebookDealsAlias) ?? $"{_options.EbookIndexName}-deals";
+
+            _ebookIndexName = $"{_options.EbookIndexName}-{DateTime.Now.Ticks}";
+            _ebookDealsIndexName = $"{_options.EbookIndexName}-deals-{DateTime.Now.Ticks}";
+
+            await _vectorIndexer.CreateIndexIfNotExists<EbookOrderIndex>(_ebookIndexName);
+            await _vectorIndexer.CreateIndexIfNotExists<EbookDealIndex>(_ebookDealsIndexName);
+        }
+
+        private async Task SwitchLiveIndices()
+        {
+            await _vectorIndexer.SetLiveIndex(_ebookIndexName, _ebookAlias);
+            await _vectorIndexer.SetLiveIndex(_ebookDealsIndexName, _ebookDealsAlias);
+        }
+    }
+}
